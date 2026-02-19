@@ -1,0 +1,64 @@
+{
+  "strategy": "ldc_macd_v1",
+  "version": "1.0",
+  "symbol": "BTCUSDT.P",
+  "exchange": "Binance",
+  "timeframe": "2m",
+  "period": {
+    "start": "2026-02-02",
+    "end": "2026-02-18",
+    "days": 16
+  },
+  "settings": {
+    "initial_capital": 10000,
+    "commission_percent": 0.04,
+    "pyramiding": 0,
+    "process_orders_on_close": true
+  },
+  "parameters": {
+    "neighbors_count": 8,
+    "max_bars_back": 12000,
+    "regime_threshold": 0.1,
+    "adx_threshold": 16,
+    "adx_enabled": true,
+    "sma_filter": true,
+    "sma_period": 195,
+    "macd_fast": 34,
+    "macd_slow": 89,
+    "macd_signal": 9,
+    "exit_mode": "Histogram crosses 0",
+    "atr_sl_length": 14,
+    "atr_sl_multiplier": 2.0,
+    "use_macd_exits": true,
+    "use_ldc_bar_exits": false,
+    "entry_hold_bars": 0
+  },
+  "results": {
+    "net_profit_usdt": 563.55,
+    "net_profit_percent": 0.56,
+    "total_trades": 135,
+    "winning_trades": 50,
+    "losing_trades": 85,
+    "win_rate_percent": 37.04,
+    "profit_factor": 1.207,
+    "max_drawdown_usdt": 640.04,
+    "max_drawdown_percent": 0.63,
+    "avg_trade_usdt": 4.17,
+    "largest_win_usdt": null,
+    "largest_loss_usdt": null
+  },
+  "notes": [
+    "Short test period (16 days) - insufficient for validation",
+    "High trade frequency (135 trades) causes significant commission drag",
+    "Performance degraded during choppy phase (Feb 9-17)",
+    "Strong performance during trending phase (Feb 3-7)",
+    "Requires 6+ months backtest for regime diversity"
+  ],
+  "next_steps": [
+    "Test on 5m and 15m timeframes",
+    "Extend backtest to Aug 2025 - Feb 2026",
+    "Implement trailing stop mechanism",
+    "Compare MACD vs LDC bar color exits",
+    "Optimize ADX threshold for ranging market avoidance"
+  ]
+}

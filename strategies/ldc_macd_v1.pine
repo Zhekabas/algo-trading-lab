@@ -1,0 +1,494 @@
+//@version=6
+// © You + original authors (jdehorty parts under MPL-2.0)
+// Strategy: Entries by Lorentzian Classification, Exits by MACD + Entry Hold (grace period)
+// + Optional exits: LDC Bar Color change, Keltner Color change (LDC-style)
+// + NEW ENTRY OPTION: LDC Bar Color flips to Green/Red (entry)
+// + v2: ATR Stop Loss added
+
+// =========================
+// ===== STRATEGY SETUP ====
+// =========================
+strategy("LDC Entries + MACD Exits (All-in-One, v6, stable + LDC exits + BarColor Entries)",
+     overlay=true, initial_capital=10000,
+     commission_type=strategy.commission.percent, commission_value=0.04,
+     pyramiding=0, calc_on_every_tick=false, process_orders_on_close=true)
+
+// ===== IMPORTS =====
+import jdehorty/MLExtensions/2 as ml
+import jdehorty/KernelFunctions/2 as kernels
+
+// =========================
+// ===== Types =============
+// =========================
+type Settings
+    float source
+    int neighborsCount
+    int maxBarsBack
+    int featureCount
+    int colorCompression
+    bool showExits
+    bool useDynamicExits
+
+type Label
+    int long
+    int short
+    int neutral
+
+type FilterSettings
+    bool useVolatilityFilter
+    bool useRegimeFilter
+    bool useAdxFilter
+    float regimeThreshold
+    int adxThreshold
+
+type Filter
+    bool volatility
+    bool regime
+    bool adx
+
+// =========================
+// ===== Helpers ===========
+// =========================
+series_from(feature_string, _close, _high, _low, _hlc3, f_paramA, f_paramB) =>
+    switch feature_string
+        "RSI" => ml.n_rsi(_close, f_paramA, f_paramB)
+        "WT"  => ml.n_wt(_hlc3, f_paramA, f_paramB)
+        "CCI" => ml.n_cci(_close, f_paramA, f_paramB)
+        "ADX" => ml.n_adx(_high, _low, _close, f_paramA)
+
+// =========================
+// ===== Inputs ============
+// =========================
+Settings settings =
+ Settings.new(
+   input.source(title='Source', defval=close, group="LDC / General"),
+   input.int(title='Neighbors Count', defval=8, group="LDC / General", minval=1, maxval=100, step=1),
+   input.int(title="Max Bars Back", defval=2000, group="LDC / General"),
+   input.int(title="Feature Count", defval=5, group="LDC / Feature Engineering", minval=2, maxval=5),
+   input.int(title="Color Compression", defval=1, group="LDC / General", minval=1, maxval=10),
+   input.bool(title="Show Default Exits (LDC)", defval=false, group="LDC / General", inline="exits"),
+   input.bool(title="Use Dynamic Exits (LDC)", defval=false, group="LDC / General", inline="exits")
+ )
+
+FilterSettings filterSettings =
+ FilterSettings.new(
+   input.bool(title="Use Volatility Filter", defval=true, group="LDC / Filters"),
+   input.bool(title="Use Regime Filter", defval=true, group="LDC / Filters", inline="regime"),
+   input.bool(title="Use ADX Filter", defval=false, group="LDC / Filters", inline="adx"),
+   input.float(title="Regime Threshold", defval=-0.1, minval=-10, maxval=10, step=0.1, group="LDC / Filters", inline="regime"),
+   input.int(title="ADX Threshold", defval=20, minval=0, maxval=100, step=1, group="LDC / Filters", inline="adx")
+ )
+
+// ===== Trend filters =====
+useEmaFilter = input.bool(title="EMA200 Filter", defval=false, group="LDC / Filters", inline="ema")
+emaPeriod    = input.int(title="Period", defval=200, minval=1, step=1, group="LDC / Filters", inline="ema")
+isEmaUptrend   = useEmaFilter ? close > ta.ema(close, emaPeriod) : true
+isEmaDowntrend = useEmaFilter ? close < ta.ema(close, emaPeriod) : true
+
+useSmaFilter = input.bool(title="SMA200 Filter", defval=false, group="LDC / Filters", inline="sma")
+smaPeriod    = input.int(title="Period", defval=200, minval=1, step=1, group="LDC / Filters", inline="sma")
+isSmaUptrend   = useSmaFilter ? close > ta.sma(close, smaPeriod) : true
+isSmaDowntrend = useSmaFilter ? close < ta.sma(close, smaPeriod) : true
+
+// ===== Kernel options =====
+useKernelFilter    = input.bool(true, "Trade with Kernel", group="LDC / Kernel", inline="kernel")
+showKernelEstimate = input.bool(true, "Show Kernel Estimate", group="LDC / Kernel", inline="kernel")
+useKernelSmoothing = input.bool(false, "Enhance Kernel Smoothing", inline='1', group='LDC / Kernel')
+h   = input.int(8, 'Lookback Window', minval=3, group="LDC / Kernel", inline="kernel")
+r   = input.float(8., 'Relative Weighting', step=0.25, group="LDC / Kernel", inline="kernel")
+x   = input.int(25, "Regression Level", group="LDC / Kernel", inline="kernel")
+lag = input.int(2, "Lag", inline='1', group='LDC / Kernel')
+
+// ===== Display =====
+showBarColors       = input.bool(true, "Show LDC Bar Colors", group="LDC / Display")
+showBarPredictions  = input.bool(false, "Show LDC Bar Prediction Values", group="LDC / Display")
+useAtrOffset        = input.bool(false, "Use ATR Offset", group="LDC / Display")
+barPredictionsOffset= input.float(0, "Bar Prediction Offset", minval=0, group="LDC / Display")
+
+// ===== Entry mode options =====
+grpEntryMode = "ENTRY (modes)"
+useSignalEntries   = input.bool(true,  "Use LDC Signal Entries (classic)", group=grpEntryMode)
+useBarColorEntries = input.bool(false, "Use LDC Bar Color Entries (flip to Green/Red)", group=grpEntryMode)
+
+// =========================
+// ===== Features ==========
+// =========================
+f1_string = input.string(title="Feature 1", options=["RSI", "WT", "CCI", "ADX"], defval="RSI", group="LDC / Feature Engineering", inline="01")
+f1_paramA = input.int(title="Param A", defval=14, group="LDC / Feature Engineering", inline="02")
+f1_paramB = input.int(title="Param B", defval=1,  group="LDC / Feature Engineering", inline="02")
+
+f2_string = input.string(title="Feature 2", options=["RSI", "WT", "CCI", "ADX"], defval="WT", group="LDC / Feature Engineering", inline="03")
+f2_paramA = input.int(title="Param A", defval=10, group="LDC / Feature Engineering", inline="04")
+f2_paramB = input.int(title="Param B", defval=11, group="LDC / Feature Engineering", inline="04")
+
+f3_string = input.string(title="Feature 3", options=["RSI", "WT", "CCI", "ADX"], defval="CCI", group="LDC / Feature Engineering", inline="05")
+f3_paramA = input.int(title="Param A", defval=20, group="LDC / Feature Engineering", inline="06")
+f3_paramB = input.int(title="Param B", defval=1,  group="LDC / Feature Engineering", inline="06")
+
+f4_string = input.string(title="Feature 4", options=["RSI", "WT", "CCI", "ADX"], defval="ADX", group="LDC / Feature Engineering", inline="07")
+f4_paramA = input.int(title="Param A", defval=20, group="LDC / Feature Engineering", inline="08")
+f4_paramB = input.int(title="Param B", defval=2,  group="LDC / Feature Engineering", inline="08")
+
+f5_string = input.string(title="Feature 5", options=["RSI", "WT", "CCI", "ADX"], defval="RSI", group="LDC / Feature Engineering", inline="09")
+f5_paramA = input.int(title="Param A", defval=9,  group="LDC / Feature Engineering", inline="10")
+f5_paramB = input.int(title="Param B", defval=1,  group="LDC / Feature Engineering", inline="10")
+
+// As plain series
+f1 = series_from(f1_string, close, high, low, hlc3, f1_paramA, f1_paramB)
+f2 = series_from(f2_string, close, high, low, hlc3, f2_paramA, f2_paramB)
+f3 = series_from(f3_string, close, high, low, hlc3, f3_paramA, f3_paramB)
+f4 = series_from(f4_string, close, high, low, hlc3, f4_paramA, f4_paramB)
+f5 = series_from(f5_string, close, high, low, hlc3, f5_paramA, f5_paramB)
+
+// Arrays
+var f1Array = array.new_float()
+var f2Array = array.new_float()
+var f3Array = array.new_float()
+var f4Array = array.new_float()
+var f5Array = array.new_float()
+array.push(f1Array, f1)
+array.push(f2Array, f2)
+array.push(f3Array, f3)
+array.push(f4Array, f4)
+array.push(f5Array, f5)
+
+// Distance
+get_ld(i, featureCount) =>
+    switch featureCount
+        5 => math.log(1 + math.abs(f1 - array.get(f1Array, i))) +
+             math.log(1 + math.abs(f2 - array.get(f2Array, i))) +
+             math.log(1 + math.abs(f3 - array.get(f3Array, i))) +
+             math.log(1 + math.abs(f4 - array.get(f4Array, i))) +
+             math.log(1 + math.abs(f5 - array.get(f5Array, i)))
+        4 => math.log(1 + math.abs(f1 - array.get(f1Array, i))) +
+             math.log(1 + math.abs(f2 - array.get(f2Array, i))) +
+             math.log(1 + math.abs(f3 - array.get(f3Array, i))) +
+             math.log(1 + math.abs(f4 - array.get(f4Array, i)))
+        3 => math.log(1 + math.abs(f1 - array.get(f1Array, i))) +
+             math.log(1 + math.abs(f2 - array.get(f2Array, i))) +
+             math.log(1 + math.abs(f3 - array.get(f3Array, i)))
+        2 => math.log(1 + math.abs(f1 - array.get(f1Array, i))) +
+             math.log(1 + math.abs(f2 - array.get(f2Array, i)))
+
+// =========================
+// ===== LDC core ==========
+// =========================
+Label direction = Label.new(long=1, short=-1, neutral=0)
+maxBarsBackIndex = last_bar_index >= settings.maxBarsBack ? last_bar_index - settings.maxBarsBack : 0
+
+Filter filter =
+ Filter.new(
+   ml.filter_volatility(1, 10, filterSettings.useVolatilityFilter),
+   ml.regime_filter(ohlc4, filterSettings.regimeThreshold, filterSettings.useRegimeFilter),
+   ml.filter_adx(settings.source, 14, filterSettings.adxThreshold, filterSettings.useAdxFilter)
+ )
+
+srcL = settings.source
+y_train_series = srcL[4] < srcL[0] ? direction.short : srcL[4] > srcL[0] ? direction.long : direction.neutral
+var y_train_array = array.new_int(0)
+array.push(y_train_array, y_train_series)
+
+var predictions = array.new_float(0)
+var prediction  = 0.0
+var signalL     = direction.neutral
+var distances   = array.new_float(0)
+
+lastDistance = -1.0
+size     = math.min(settings.maxBarsBack-1, array.size(y_train_array)-1)
+sizeLoop = math.min(settings.maxBarsBack-1, size)
+
+if bar_index >= maxBarsBackIndex
+    for i = 0 to sizeLoop
+        d = get_ld(i, settings.featureCount)
+        if d >= lastDistance and (i % 4 != 0)
+            lastDistance := d
+            array.push(distances, d)
+            array.push(predictions, math.round(array.get(y_train_array, i)))
+            if array.size(predictions) > settings.neighborsCount
+                lastDistance := array.get(distances, math.round(settings.neighborsCount*3/4))
+                array.shift(distances)
+                array.shift(predictions)
+    prediction := array.sum(predictions)
+
+// Filters
+filter_all = filter.volatility and filter.regime and filter.adx
+signalL := prediction > 0 and filter_all ? direction.long :
+           prediction < 0 and filter_all ? direction.short : nz(signalL[1])
+
+// =========================
+// ===== Kernel ============
+// =========================
+c_green = color.new(#009988, 20)
+c_red   = color.new(#CC3311, 20)
+transparent = color.new(#000000, 100)
+
+yhat1 = kernels.rationalQuadratic(settings.source, h, r, x)
+yhat2 = kernels.gaussian(settings.source, h - lag, x)
+
+isBearishRate   = yhat1[1] > yhat1
+isBullishRate   = yhat1[1] < yhat1
+isBullishSmooth = yhat2 >= yhat1
+isBearishSmooth = yhat2 <= yhat1
+
+plotColor = showKernelEstimate ? (useKernelSmoothing ? (isBullishSmooth ? c_green : c_red)
+                                                 : (isBullishRate ? c_green : c_red)) : transparent
+plot(showKernelEstimate ? yhat1 : na, color=plotColor, linewidth=2, title="Kernel Estimate")
+
+isBullish = useKernelFilter ? (useKernelSmoothing ? isBullishSmooth : isBullishRate) : true
+isBearish = useKernelFilter ? (useKernelSmoothing ? isBearishSmooth : isBearishRate) : true
+
+// =========================
+// ===== Classic entries ====
+// =========================
+var int barsHeld = 0
+isDifferentSignalType = signalL != signalL[1]
+barsHeld := isDifferentSignalType ? 0 : (barsHeld + 1)
+
+isBuySignal  = signalL == direction.long  and isEmaUptrend   and isSmaUptrend
+isSellSignal = signalL == direction.short and isEmaDowntrend and isSmaDowntrend
+isNewBuySignal  = isBuySignal  and isDifferentSignalType
+isNewSellSignal = isSellSignal and isDifferentSignalType
+
+startLongTradeClassic  = useSignalEntries and isNewBuySignal  and isBullish and isEmaUptrend and isSmaUptrend
+startShortTradeClassic = useSignalEntries and isNewSellSignal and isBearish and isEmaDowntrend and isSmaDowntrend
+
+// =========================
+// ===== BarColor entries ===
+// =========================
+int ldcBarState = prediction > 0 ? 1 : prediction < 0 ? -1 : 0
+
+barFlipToGreen = (ldcBarState == 1 and ldcBarState[1] != 1)
+barFlipToRed   = (ldcBarState == -1 and ldcBarState[1] != -1)
+
+startLongTradeBarColor  = useBarColorEntries and barFlipToGreen and isBullish and isEmaUptrend and isSmaUptrend
+startShortTradeBarColor = useBarColorEntries and barFlipToRed   and isBearish and isEmaDowntrend and isSmaDowntrend
+
+// Combined entry
+startLongTrade  = startLongTradeClassic  or startLongTradeBarColor
+startShortTrade = startShortTradeClassic or startShortTradeBarColor
+
+// =========================
+// ===== MACD Exit ==========
+// =========================
+fast_length   = input.int(title="MACD Fast Length", defval=12, group="MACD Exit")
+slow_length   = input.int(title="MACD Slow Length", defval=26, group="MACD Exit")
+srcMACD       = input.source(title="MACD Source", defval=close, group="MACD Exit")
+signal_length = input.int(title="Signal Smoothing", minval=1, maxval=50, defval=9, group="MACD Exit")
+sma_source    = input.string(title="Oscillator MA Type", defval="EMA", options=["SMA","EMA"], group="MACD Exit")
+sma_signal    = input.string(title="Signal Line MA Type", defval="EMA", options=["SMA","EMA"], group="MACD Exit")
+
+fast_ma = sma_source == "SMA" ? ta.sma(srcMACD, fast_length) : ta.ema(srcMACD, fast_length)
+slow_ma = sma_source == "SMA" ? ta.sma(srcMACD, slow_length) : ta.ema(srcMACD, slow_length)
+macd    = fast_ma - slow_ma
+signalM = sma_signal == "SMA" ? ta.sma(macd, signal_length) : ta.ema(macd, signal_length)
+hist    = macd - signalM
+
+was_rising  = hist[1] > hist[2]
+was_falling = hist[1] < hist[2]
+now_rising  = hist > hist[1]
+now_falling = hist < hist[1]
+in_pos = hist > 0
+in_neg = hist < 0
+
+exit_mode = input.string("Slope Flip (global)",
+     options=[
+       "Slope Flip (global)",
+       "Slope Flip (above 0)",
+       "Slope Flip (below 0)",
+       "Histogram crosses 0",
+       "MACD crosses Signal"
+     ],
+     title="Exit Rule", group="MACD Exit")
+
+bearishFlipGlobal = was_rising  and now_falling
+bullishFlipGlobal = was_falling and now_rising
+bearishFlipPos    = bearishFlipGlobal and in_pos
+bullishFlipPos    = bullishFlipGlobal and in_pos
+bearishFlipNeg    = bearishFlipGlobal and in_neg
+bullishFlipNeg    = bullishFlipGlobal and in_neg
+histCrossDown0    = ta.crossunder(hist, 0)
+histCrossUp0      = ta.crossover(hist, 0)
+macdCrossUpSig    = ta.crossover(macd, signalM)
+macdCrossDnSig    = ta.crossunder(macd, signalM)
+
+exitLongSignalMACD = switch exit_mode
+    "Slope Flip (global)"   => bearishFlipGlobal
+    "Slope Flip (above 0)"  => bearishFlipPos
+    "Slope Flip (below 0)"  => bearishFlipNeg
+    "Histogram crosses 0"   => histCrossDown0
+    => macdCrossDnSig
+
+exitShortSignalMACD = switch exit_mode
+    "Slope Flip (global)"   => bullishFlipGlobal
+    "Slope Flip (above 0)"  => bullishFlipPos
+    "Slope Flip (below 0)"  => bullishFlipNeg
+    "Histogram crosses 0"   => histCrossUp0
+    => macdCrossUpSig
+
+bool macdAgainstLong = switch exit_mode
+    "Slope Flip (global)"   => now_falling
+    "Slope Flip (above 0)"  => now_falling
+    "Slope Flip (below 0)"  => now_falling
+    "Histogram crosses 0"   => hist <= 0
+    => macd < signalM
+
+bool macdAgainstShort = switch exit_mode
+    "Slope Flip (global)"   => now_rising
+    "Slope Flip (above 0)"  => now_rising
+    "Slope Flip (below 0)"  => now_rising
+    "Histogram crosses 0"   => hist >= 0
+    => macd > signalM
+
+// =========================
+// ===== LDC exits ==========
+// =========================
+grpLdcExit = "LDC Exit (new)"
+useMACDExit      = input.bool(true,  "Use MACD exits", group=grpLdcExit)
+useLdcBarExit    = input.bool(false, "Exit on LDC bar color change (Green/Red -> White or opposite)", group=grpLdcExit)
+useKeltnerExit   = input.bool(false, "Exit on Keltner color change (LDC-style)", group=grpLdcExit)
+keltTrendSource  = input.string("Kernel", "Keltner color source", options=["Kernel", "LDC Signal"], group=grpLdcExit)
+showKeltner      = input.bool(false, "Show Keltner Channel", group=grpLdcExit)
+keltLen          = input.int(20, "Keltner Length", minval=1, group=grpLdcExit, inline="k1")
+keltAtrLen       = input.int(10, "ATR Length", minval=1, group=grpLdcExit, inline="k1")
+keltMult         = input.float(1.5, "ATR Mult", minval=0.1, step=0.1, group=grpLdcExit, inline="k2")
+
+bool exitLongSignalBar  = (ldcBarState[1] == 1 and ldcBarState != 1)
+bool exitShortSignalBar = (ldcBarState[1] == -1 and ldcBarState != -1)
+bool barAgainstLong  = ldcBarState != 1
+bool barAgainstShort = ldcBarState != -1
+
+basisK = ta.ema(close, keltLen)
+rangeK = ta.atr(keltAtrLen) * keltMult
+upperK = basisK + rangeK
+lowerK = basisK - rangeK
+
+int keltState = keltTrendSource == "Kernel" ? (isBullish ? 1 : isBearish ? -1 : 0) : (signalL == direction.long ? 1 : signalL == direction.short ? -1 : 0)
+bool exitLongSignalKelt  = (keltState[1] == 1 and keltState != 1)
+bool exitShortSignalKelt = (keltState[1] == -1 and keltState != -1)
+bool keltAgainstLong  = keltState != 1
+bool keltAgainstShort = keltState != -1
+
+// =========================
+// ===== Stop Loss ==========
+// =========================
+grpSL = "Risk / Stop Loss"
+useATRStop   = input.bool(true,   "Use ATR Stop Loss",    group=grpSL, inline="atr")
+atrSLLen     = input.int(14,      "ATR Len",              group=grpSL, minval=1, inline="atr")
+atrSLMult    = input.float(2.0,   "Mult",                 group=grpSL, minval=0.1, step=0.1, inline="atr")
+useFixedSL   = input.bool(false,  "Use Fixed USDT SL",    group=grpSL, inline="fixed")
+fixedSLUsdt  = input.float(100.0, "Amount $",             group=grpSL, minval=1, inline="fixed")
+showSLLines  = input.bool(true,   "Show SL Lines",        group=grpSL)
+
+atrSLValue = ta.atr(atrSLLen)
+// Fixed SL: convert USDT amount to price distance (assumes full capital in trade)
+fixedSLDist(entryPrice) =>
+    entryPrice * fixedSLUsdt / strategy.initial_capital
+
+var float longSLLevel  = na
+var float shortSLLevel = na
+
+// =========================
+// ===== Entry hold =========
+// =========================
+grpHold = "Risk / Trade Management"
+useHold     = input.bool(true, "Lock exits for first N bars", group=grpHold, inline="H")
+minHoldBars = input.int(5,     "Min Bars To Hold After Entry", group=grpHold, inline="H", minval=0, maxval=500)
+
+var int entryBar = na
+
+// Open orders + remember entry bar + set SL
+if startLongTrade and strategy.position_size <= 0
+    strategy.entry("Long", strategy.long)
+    entryBar     := bar_index
+    atrDist      = atrSLValue * atrSLMult
+    fixDist      = fixedSLDist(close)
+    slDist       = useFixedSL and useATRStop ? math.min(atrDist, fixDist) :
+                   useFixedSL               ? fixDist :
+                   useATRStop               ? atrDist : na
+    longSLLevel  := not na(slDist) ? close - slDist : na
+    shortSLLevel := na
+
+if startShortTrade and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short)
+    entryBar     := bar_index
+    atrDist      = atrSLValue * atrSLMult
+    fixDist      = fixedSLDist(close)
+    slDist       = useFixedSL and useATRStop ? math.min(atrDist, fixDist) :
+                   useFixedSL               ? fixDist :
+                   useATRStop               ? atrDist : na
+    shortSLLevel := not na(slDist) ? close + slDist : na
+    longSLLevel  := na
+
+// Clear SL when flat (but not on the same bar as a new entry)
+if strategy.position_size == 0 and not startLongTrade and not startShortTrade
+    longSLLevel  := na
+    shortSLLevel := na
+
+// Apply Stop Loss orders
+if not na(longSLLevel)
+    strategy.exit("Long SL", from_entry="Long", stop=longSLLevel)
+if not na(shortSLLevel)
+    strategy.exit("Short SL", from_entry="Short", stop=shortSLLevel)
+
+barsSinceEntry = strategy.position_size != 0 and not na(entryBar) ? (bar_index - entryBar) : na
+
+bool holdActive    = useHold and strategy.position_size != 0 and not na(barsSinceEntry) and barsSinceEntry < minHoldBars
+bool holdJustEnded = useHold and strategy.position_size != 0 and not na(barsSinceEntry) and barsSinceEntry == minHoldBars
+bool canExit       = strategy.position_size != 0 and (not useHold or (not na(barsSinceEntry) and barsSinceEntry >= minHoldBars))
+
+// =========================
+// ===== Combine exits ======
+// =========================
+bool exitLongSignalCombined  = (useMACDExit ? exitLongSignalMACD : false) or (useLdcBarExit ? exitLongSignalBar : false) or (useKeltnerExit ? exitLongSignalKelt : false)
+bool exitShortSignalCombined = (useMACDExit ? exitShortSignalMACD : false) or (useLdcBarExit ? exitShortSignalBar : false) or (useKeltnerExit ? exitShortSignalKelt : false)
+
+bool forcedExitLong  = holdJustEnded and ((useMACDExit and macdAgainstLong) or (useLdcBarExit and barAgainstLong) or (useKeltnerExit and keltAgainstLong))
+bool forcedExitShort = holdJustEnded and ((useMACDExit and macdAgainstShort) or (useLdcBarExit and barAgainstShort) or (useKeltnerExit and keltAgainstShort))
+
+bool allowExitLong  = strategy.position_size > 0 and ((canExit and exitLongSignalCombined) or forcedExitLong)
+bool allowExitShort = strategy.position_size < 0 and ((canExit and exitShortSignalCombined) or forcedExitShort)
+
+if allowExitLong
+    strategy.close("Long")
+if allowExitShort
+    strategy.close("Short")
+
+// =========================
+// ===== Visuals ============
+// =========================
+// MACD використовується тільки для логіки — на чарті не відображається
+
+// SL lines — тонкі, тільки коли позиція активна
+plot(showSLLines ? longSLLevel  : na, "Long SL",  color=color.new(color.red,   0), style=plot.style_linebr, linewidth=1)
+plot(showSLLines ? shortSLLevel : na, "Short SL", color=color.new(color.lime,  0), style=plot.style_linebr, linewidth=1)
+
+// Keltner (optional)
+keltCol = keltState == 1 ? color.new(#009988, 0) : keltState == -1 ? color.new(#CC3311, 0) : color.new(#BBBBBB, 0)
+plot(showKeltner ? basisK : na, "Keltner Basis", color=keltCol, linewidth=2)
+plot(showKeltner ? upperK : na, "Keltner Upper", color=color.new(keltCol, 0))
+plot(showKeltner ? lowerK : na, "Keltner Lower", color=color.new(keltCol, 0))
+
+// LDC barcolor/predictions
+atrSpaced = useAtrOffset ? ta.atr(1) : na
+compressionFactor = settings.neighborsCount / settings.colorCompression
+var color c_pred = na
+if prediction > 0
+    c_pred := color.from_gradient(prediction, 0, compressionFactor, #787b86, #009988)
+else
+    c_pred := color.from_gradient(prediction, -compressionFactor, 0, #CC3311, #787b86)
+
+barcolor(showBarColors ? color.new(c_pred, 50) : na)
+
+y_val = useAtrOffset ? (prediction > 0 ? high + atrSpaced : low - atrSpaced)
+                     : (prediction > 0 ? high + hl2*barPredictionsOffset/20 : low - hl2*barPredictionsOffset/30)
+if showBarPredictions
+    label.new(bar_index, y_val, str.tostring(prediction), xloc.bar_index, yloc.price,
+              color.new(color.white, 100), label.style_label_up, c_pred, size.normal, text.align_left)
+
+// =========================
+// ===== Alerts ============
+// =========================
+alertcondition(startLongTrade,  title='Open Long ▲',  message='Open Long | {{ticker}}@{{close}} | {{interval}}')
+alertcondition(startShortTrade, title='Open Short ▼', message='Open Short | {{ticker}}@{{close}} | {{interval}}')
+alertcondition(allowExitLong,   title='Exit Long',    message='Exit Long | {{ticker}}@{{close}} | {{interval}}')
+alertcondition(allowExitShort,  title='Exit Short',   message='Exit Short | {{ticker}}@{{close}} | {{interval}}')
